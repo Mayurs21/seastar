@@ -650,7 +650,7 @@ public:
 
         ss << "size: " << _cache.size() << "\n";
         ss << "buckets: " << _cache.bucket_count() << "\n";
-        ss << "load: " << to_sstring_sprintf((double)_cache.size() / _cache.bucket_count(), "%.2lf") << "\n";
+        ss << "load: " << sprint("%.2lf", (double)_cache.size() / _cache.bucket_count()) << "\n";
         ss << "max bucket occupancy: " << max_size << "\n";
         ss << "bucket occupancy histogram:\n";
 
@@ -1305,6 +1305,8 @@ public:
                     return conn->_proto.handle(conn->_in, conn->_out).then([conn] {
                         return conn->_out.flush();
                     });
+                }).finally([conn] {
+                    return conn->_out.close().finally([conn]{});
                 });
             });
         }).or_terminate();

@@ -17,9 +17,6 @@
  */
 /*
  * Copyright (C) 2014 Cloudius Systems, Ltd.
- *
- * This work is open source software, licensed under the terms of the
- * BSD license as described in the LICENSE file in the top-level directory.
  */
 
 #include <functional>
@@ -475,7 +472,7 @@ boost::program_options::options_description get_options_description() {
     char hostname[PATH_MAX];
     gethostname(hostname, sizeof(hostname));
     hostname[PATH_MAX-1] = '\0';
-    opts.add_options()("collectd", bpo::value<bool>()->default_value(true),
+    opts.add_options()("collectd", bpo::value<bool>()->default_value(false),
             "enable collectd daemon")("collectd-address",
             bpo::value<std::string>()->default_value("239.192.74.66:25826"),
             "address to send/broadcast metrics to")("collectd-poll-period",

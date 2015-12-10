@@ -71,11 +71,21 @@ struct directory_entry {
     std::experimental::optional<directory_entry_type> type;
 };
 
+/// File open options
+///
+/// Options used to configure an open file.
+///
+/// \ref file
+struct file_open_options {
+    uint64_t extent_allocation_size_hint = 1 << 20; ///< Allocate this much disk space when extending the file
+};
+
 /// \cond internal
 class file_impl {
 public:
     unsigned _memory_dma_alignment = 4096;
-    unsigned _disk_dma_alignment = 4096;
+    unsigned _disk_read_dma_alignment = 4096;
+    unsigned _disk_write_dma_alignment = 4096;
 public:
     virtual ~file_impl() {}
 
@@ -98,9 +108,7 @@ public:
 class posix_file_impl : public file_impl {
 public:
     int _fd;
-    posix_file_impl(int fd) : _fd(fd) {
-        query_dma_alignment();
-    }
+    posix_file_impl(int fd, file_open_options options);
     virtual ~posix_file_impl() override;
     future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len);
     future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov);
@@ -120,23 +128,12 @@ private:
 
 class blockdev_file_impl : public posix_file_impl {
 public:
-    blockdev_file_impl(int fd) : posix_file_impl(fd) {}
+    blockdev_file_impl(int fd, file_open_options options);
     future<> truncate(uint64_t length) override;
     future<> discard(uint64_t offset, uint64_t length) override;
     future<size_t> size(void) override;
     virtual future<> allocate(uint64_t position, uint64_t length) override;
 };
-
-inline
-shared_ptr<file_impl>
-make_file_impl(int fd) {
-    auto r = ::ioctl(fd, BLKGETSIZE);
-    if (r != -1) {
-        return make_shared<blockdev_file_impl>(fd);
-    } else {
-        return make_shared<posix_file_impl>(fd);
-    }
-}
 
 /// \endcond
 
@@ -152,8 +149,7 @@ make_file_impl(int fd) {
 class file {
     shared_ptr<file_impl> _file_impl;
 private:
-    explicit file(int fd) : _file_impl(make_file_impl(fd)) {}
-
+    explicit file(int fd, file_open_options options);
 public:
     /// Default constructor constructs an uninitialized file object.
     ///
@@ -179,7 +175,7 @@ public:
     /// \param x file object to be copied
     file(const file& x) = default;
     /// Moves a file object.
-    file(file&& x) : _file_impl(std::move(x._file_impl)) {}
+    file(file&& x) noexcept : _file_impl(std::move(x._file_impl)) {}
     /// Assigns a file object.  After assignent, the destination and source refer
     /// to the same underlying file.
     ///
@@ -196,9 +192,14 @@ public:
     // we will end up with various pages around, some of them with
     // overlapping ranges. Those would be very challenging to cache.
 
-    /// Alignment requirement for file offsets
-    uint64_t disk_dma_alignment() const {
-        return _file_impl->_disk_dma_alignment;
+    /// Alignment requirement for file offsets (for reads)
+    uint64_t disk_read_dma_alignment() const {
+        return _file_impl->_disk_read_dma_alignment;
+    }
+
+    /// Alignment requirement for file offsets (for writes)
+    uint64_t disk_write_dma_alignment() const {
+        return _file_impl->_disk_write_dma_alignment;
     }
 
     /// Alignment requirement for data buffers
@@ -497,14 +498,14 @@ future<temporary_buffer<CharType>>
 file::dma_read_bulk(uint64_t offset, size_t range_size) {
     using tmp_buf_type = typename read_state<CharType>::tmp_buf_type;
 
-    auto front = offset & (disk_dma_alignment() - 1);
+    auto front = offset & (disk_read_dma_alignment() - 1);
     offset -= front;
     range_size += front;
 
     auto rstate = make_lw_shared<read_state<CharType>>(offset, front,
                                                        range_size,
                                                        memory_dma_alignment(),
-                                                       disk_dma_alignment());
+                                                       disk_read_dma_alignment());
 
     //
     // First, try to read directly into the buffer. Most of the reads will
@@ -560,7 +561,7 @@ file::read_maybe_eof(uint64_t pos, size_t len) {
     // an EINVAL error due to unaligned destination buffer.
     //
     temporary_buffer<CharType> buf = temporary_buffer<CharType>::aligned(
-               memory_dma_alignment(), align_up(len, disk_dma_alignment()));
+               memory_dma_alignment(), align_up(len, disk_read_dma_alignment()));
 
     // try to read a single bulk from the given position
     return dma_read(pos, buf.get_write(), buf.size()).then_wrapped(

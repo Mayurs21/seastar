@@ -16,7 +16,7 @@ Building Seastar
 
 Installing required packages:
 ```
-yum install gcc-c++ libaio-devel ninja-build ragel hwloc-devel numactl-devel libpciaccess-devel cryptopp-devel xen-devel boost-devel libxml2-devel xfsprogs-devel
+yum install gcc-c++ libaio-devel ninja-build ragel hwloc-devel numactl-devel libpciaccess-devel cryptopp-devel xen-devel boost-devel libxml2-devel xfsprogs-devel gnutls-devel
 ```
 
 You then need to run the following to create the "build.ninja" file:
@@ -46,7 +46,7 @@ yum --enablerepo rawhide install libubsan libasan
 
 Installing required packages:
 ```
-yum install libaio-devel ninja-build ragel hwloc-devel numactl-devel libpciaccess-devel cryptopp-devel
+yum install libaio-devel ninja-build ragel hwloc-devel numactl-devel libpciaccess-devel cryptopp-devel gnutls-devel
 ```
 
 You then need to run the following to create the "build.ninja" file:
@@ -66,7 +66,7 @@ ninja-build
 
 Installing required packages:
 ```
-sudo apt-get install libaio-dev ninja-build ragel libhwloc-dev libnuma-dev libpciaccess-dev libcrypto++-dev libboost-all-dev libxen-dev libxml2-dev
+sudo apt-get install libaio-dev ninja-build ragel libhwloc-dev libnuma-dev libpciaccess-dev libcrypto++-dev libboost-all-dev libxen-dev libxml2-dev xfslibs-dev
 ```
 
 Installing GCC 4.9 for gnu++1y. Unlike the Fedora case above, this will
@@ -90,11 +90,7 @@ sudo apt-get install gcc-4.9-multilib g++-4.9-multilib
 To compile Seastar explicitly using gcc 4.9, use:
 ```
 ./configure.py --compiler=g++-4.9
-```
-
-To compile OSv explicitly using gcc 4.9, use:
-```
-make CC=gcc-4.9 CXX=g++-4.9 -j 24
+ninja
 ```
 
 ### Building seastar in Docker container

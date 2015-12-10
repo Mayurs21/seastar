@@ -185,78 +185,6 @@ private:
     std::unique_ptr<pollable_fd_state> _s;
 };
 
-class connected_socket_impl {
-public:
-    virtual ~connected_socket_impl() {}
-    virtual input_stream<char> input() = 0;
-    virtual output_stream<char> output() = 0;
-    virtual void shutdown_input() = 0;
-    virtual void shutdown_output() = 0;
-    virtual void set_nodelay(bool nodelay) = 0;
-    virtual bool get_nodelay() const = 0;
-};
-
-/// \addtogroup networking-module
-/// @{
-
-/// A TCP (or other stream-based protocol) connection.
-///
-/// A \c connected_socket represents a full-duplex stream between
-/// two endpoints, a local endpoint and a remote endpoint.
-class connected_socket {
-    std::unique_ptr<connected_socket_impl> _csi;
-public:
-    /// Constructs a \c connected_socket not corresponding to a connection
-    connected_socket() {};
-    /// \cond internal
-    explicit connected_socket(std::unique_ptr<connected_socket_impl> csi)
-        : _csi(std::move(csi)) {}
-    /// \endcond
-    /// Moves a \c connected_socket object.
-    connected_socket(connected_socket&& cs) = default;
-    /// Move-assigns a \c connected_socket object.
-    connected_socket& operator=(connected_socket&& cs) = default;
-    /// Gets the input stream.
-    ///
-    /// Gets an object returning data sent from the remote endpoint.
-    input_stream<char> input();
-    /// Gets the output stream.
-    ///
-    /// Gets an object that sends data to the remote endpoint.
-    output_stream<char> output();
-    /// Sets the TCP_NODELAY option (disabling Nagle's algorithm)
-    void set_nodelay(bool nodelay);
-    /// Gets the TCP_NODELAY option (Nagle's algorithm)
-    ///
-    /// \return whether the nodelay option is enabled or not
-    bool get_nodelay() const;
-    /// Disables output to the socket.
-    ///
-    /// Current or future writes that have not been successfully flushed
-    /// will immediately fail with an error.  This is useful to abort
-    /// operations on a socket that is not making progress due to a
-    /// peer failure.
-    void shutdown_output();
-    /// Disables input from the socket.
-    ///
-    /// Current or future reads will immediately fail with an error.
-    /// This is useful to abort operations on a socket that is not making
-    /// progress due to a peer failure.
-    void shutdown_input();
-    /// Disables socket input and output.
-    ///
-    /// Equivalent to \ref shutdown_input() and \ref shutdown_output().
-};
-/// @}
-
-/// \cond internal
-class server_socket_impl {
-public:
-    virtual ~server_socket_impl() {}
-    virtual future<connected_socket, socket_address> accept() = 0;
-    virtual void abort_accept() = 0;
-};
-/// \endcond
 
 namespace std {
 
@@ -271,96 +199,13 @@ struct hash<::sockaddr_in> {
 
 bool operator==(const ::sockaddr_in a, const ::sockaddr_in b);
 
-/// \addtogroup networking-module
-/// @{
-
-/// A listening socket, waiting to accept incoming network connections.
-class server_socket {
-    std::unique_ptr<server_socket_impl> _ssi;
-public:
-    /// Constructs a \c server_socket not corresponding to a connection
-    server_socket() {}
-    /// \cond internal
-    explicit server_socket(std::unique_ptr<server_socket_impl> ssi)
-        : _ssi(std::move(ssi)) {}
-    /// \endcond
-    /// Moves a \c server_socket object.
-    server_socket(server_socket&& ss) = default;
-    /// Move-assigns a \c server_socket object.
-    server_socket& operator=(server_socket&& cs) = default;
-
-    /// Accepts the next connection to successfully connect to this socket.
-    ///
-    /// \return a \ref connected_socket representing the connection, and
-    ///         a \ref socket_address describing the remote endpoint.
-    ///
-    /// \see listen(socket_address sa)
-    /// \see listen(socket_address sa, listen_options opts)
-    future<connected_socket, socket_address> accept() {
-        return _ssi->accept();
-    }
-
-    /// Stops any \ref accept() in progress.
-    ///
-    /// Current and future \ref accept() calls will terminate immediately
-    /// with an error.
-    void abort_accept() {
-        return _ssi->abort_accept();
-    }
-};
-/// @}
-
-class network_stack {
-public:
-    virtual ~network_stack() {}
-    virtual server_socket listen(socket_address sa, listen_options opts) = 0;
-    // FIXME: local parameter assumes ipv4 for now, fix when adding other AF
-    virtual future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, 0})) = 0;
-    virtual net::udp_channel make_udp_channel(ipv4_addr addr = {}) = 0;
-    virtual future<> initialize() {
-        return make_ready_future();
-    }
-    virtual bool has_per_core_namespace() = 0;
-};
-
-class network_stack_registry {
-public:
-    using options = boost::program_options::variables_map;
-private:
-    static std::unordered_map<sstring,
-            std::function<future<std::unique_ptr<network_stack>> (options opts)>>& _map() {
-        static std::unordered_map<sstring,
-                std::function<future<std::unique_ptr<network_stack>> (options opts)>> map;
-        return map;
-    }
-    static sstring& _default() {
-        static sstring def;
-        return def;
-    }
-public:
-    static boost::program_options::options_description& options_description() {
-        static boost::program_options::options_description opts;
-        return opts;
-    }
-    static void register_stack(sstring name,
-            boost::program_options::options_description opts,
-            std::function<future<std::unique_ptr<network_stack>> (options opts)> create,
-            bool make_default = false);
-    static sstring default_stack();
-    static std::vector<sstring> list();
-    static future<std::unique_ptr<network_stack>> create(options opts);
-    static future<std::unique_ptr<network_stack>> create(sstring name, options opts);
-};
-
 class network_stack_registrator {
 public:
     using options = boost::program_options::variables_map;
     explicit network_stack_registrator(sstring name,
             boost::program_options::options_description opts,
             std::function<future<std::unique_ptr<network_stack>> (options opts)> factory,
-            bool make_default = false) {
-        network_stack_registry::register_stack(name, opts, factory, make_default);
-    }
+            bool make_default = false);
 };
 
 class writeable_eventfd;
@@ -456,8 +301,16 @@ class smp_message_queue {
     static constexpr size_t batch_size = 16;
     static constexpr size_t prefetch_cnt = 2;
     struct work_item;
-    using lf_queue = boost::lockfree::spsc_queue<work_item*,
+    struct lf_queue_remote {
+        reactor* remote;
+    };
+    using lf_queue_base = boost::lockfree::spsc_queue<work_item*,
                             boost::lockfree::capacity<queue_length>>;
+    // use inheritence to control placement order
+    struct lf_queue : lf_queue_remote, lf_queue_base {
+        lf_queue(reactor* remote) : lf_queue_remote{remote} {}
+        void maybe_wakeup();
+    };
     lf_queue _pending;
     lf_queue _completed;
     struct alignas(64) {
@@ -525,7 +378,7 @@ class smp_message_queue {
     } _tx;
     std::vector<work_item*> _completed_fifo;
 public:
-    smp_message_queue();
+    smp_message_queue(reactor* from, reactor* to);
     template <typename Func>
     futurize_t<std::result_of_t<Func()>> submit(Func&& func) {
         auto wi = new async_work_item<Func>(std::forward<Func>(func));
@@ -587,7 +440,7 @@ public:
     // and just processes events that have already happened, if any.
     // After the optional wait, just before processing the events, the
     // pre_process() function is called.
-    virtual bool wait_and_process() = 0;
+    virtual bool wait_and_process(int timeout = -1, const sigset_t* active_sigmask = nullptr) = 0;
     // Methods that allow polling on file descriptors. This will only work on
     // reactor_backend_epoll. Other reactor_backend will probably abort if
     // they are called (which is fine if no file descriptors are waited on):
@@ -618,7 +471,7 @@ private:
 public:
     reactor_backend_epoll();
     virtual ~reactor_backend_epoll() override { }
-    virtual bool wait_and_process() override;
+    virtual bool wait_and_process(int timeout, const sigset_t* active_sigmask) override;
     virtual future<> readable(pollable_fd_state& fd) override;
     virtual future<> writeable(pollable_fd_state& fd) override;
     virtual void forget(pollable_fd_state& fd) override;
@@ -670,9 +523,35 @@ class reactor {
 private:
     struct pollfn {
         virtual ~pollfn() {}
-        virtual bool poll_and_check_more_work() = 0;
+        // Returns true if work was done (false = idle)
+        virtual bool poll() = 0;
+        // Tries to enter interrupt mode.
+        //
+        // If it returns true, then events from this poller will wake
+        // a sleeping idle loop, and exit_interrupt_mode() must be called
+        // to return to normal polling.
+        //
+        // If it returns false, the sleeping idle loop may not be entered.
+        virtual bool try_enter_interrupt_mode() { return false; }
+        virtual void exit_interrupt_mode() {}
     };
 
+    class io_pollfn;
+    class signal_pollfn;
+    class aio_batch_submit_pollfn;
+    class batch_flush_pollfn;
+    class smp_pollfn;
+    class drain_cross_cpu_freelist_pollfn;
+    class lowres_timer_pollfn;
+    class epoll_pollfn;
+    friend io_pollfn;
+    friend signal_pollfn;
+    friend aio_batch_submit_pollfn;
+    friend batch_flush_pollfn;
+    friend smp_pollfn;
+    friend drain_cross_cpu_freelist_pollfn;
+    friend lowres_timer_pollfn;
+    friend class epoll_pollfn;
 public:
     class poller {
         std::unique_ptr<pollfn> _pollfn;
@@ -681,8 +560,11 @@ public:
         registration_task* _registration_task;
     public:
         template <typename Func> // signature: bool ()
-        explicit poller(Func&& poll_and_check_more_work)
-                : _pollfn(make_pollfn(std::forward<Func>(poll_and_check_more_work))) {
+        static poller simple(Func&& poll) {
+            return poller(make_pollfn(std::forward<Func>(poll)));
+        }
+        poller(std::unique_ptr<pollfn> fn)
+                : _pollfn(std::move(fn)) {
             do_register();
         }
         ~poller();
@@ -704,6 +586,7 @@ private:
 #else
     reactor_backend_epoll _backend;
 #endif
+    sigset_t _active_sigmask; // holds sigmask while sleeping with sig disabled
     std::vector<pollfn*> _pollers;
     static constexpr size_t max_aio = 128;
     std::vector<std::function<future<> ()>> _exit_funcs;
@@ -741,14 +624,16 @@ private:
     const bool _reuseport;
     circular_buffer<double> _loads;
     double _load = 0;
-    struct flush_batch_entry {
-        promise<> done;
-        output_stream<char>& os;
-    };
-    circular_buffer<flush_batch_entry> _flush_batching;
+    std::chrono::nanoseconds _max_poll_time{200};
+    circular_buffer<output_stream<char>* > _flush_batching;
+    std::atomic<bool> _sleeping alignas(64);
+    pthread_t _thread_id alignas(64) = pthread_self();
 private:
     static void clear_task_quota(int);
+    void wakeup();
     bool flush_pending_aio();
+    bool flush_tcp_batches();
+    bool do_expire_lowres_timers();
     void abort_on_error(int ret);
     template <typename T, typename E, typename EnableFunc>
     void complete_timers(T&, E&, EnableFunc&& enable_fn);
@@ -800,6 +685,7 @@ public:
     server_socket listen(socket_address sa, listen_options opts = {});
 
     future<connected_socket> connect(socket_address sa);
+    future<connected_socket> connect(socket_address, socket_address);
 
     pollable_fd posix_listen(socket_address sa, listen_options opts = {});
 
@@ -816,12 +702,13 @@ public:
 
     future<> write_all(pollable_fd_state& fd, const void* buffer, size_t size);
 
-    future<file> open_file_dma(sstring name, open_flags flags);
+    future<file> open_file_dma(sstring name, open_flags flags, file_open_options options = {});
     future<file> open_directory(sstring name);
     future<> make_directory(sstring name);
     future<> touch_directory(sstring name);
     future<std::experimental::optional<directory_entry_type>>  file_type(sstring name);
     future<uint64_t> file_size(sstring pathname);
+    future<bool> file_exists(sstring pathname);
     future<fs_type> file_system_at(sstring pathname);
     future<> remove_file(sstring pathname);
     future<> rename_file(sstring old_pathname, sstring new_pathname);
@@ -853,13 +740,8 @@ public:
     network_stack& net() { return *_network_stack; }
     unsigned cpu_id() const { return _id; }
 
-    void start_epoll() {
-        if (!_epoll_poller) {
-            _epoll_poller = poller([this] {
-                return wait_and_process();
-            });
-        }
-    }
+    void start_epoll();
+    void sleep();
 
 #ifdef HAVE_OSV
     void timer_thread_func();
@@ -902,10 +784,10 @@ private:
     friend class smp;
     friend class smp_message_queue;
     friend class poller;
-    friend future<> add_to_flush_poller(output_stream<char>& os);
+    friend void add_to_flush_poller(output_stream<char>* os);
 public:
-    bool wait_and_process() {
-        return _backend.wait_and_process();
+    bool wait_and_process(int timeout = 0, const sigset_t* active_sigmask = nullptr) {
+        return _backend.wait_and_process(timeout, active_sigmask);
     }
 
     future<> readable(pollable_fd_state& fd) {
@@ -939,7 +821,7 @@ reactor::make_pollfn(Func&& func) {
     struct the_pollfn : pollfn {
         the_pollfn(Func&& func) : func(std::forward<Func>(func)) {}
         Func func;
-        virtual bool poll_and_check_more_work() override {
+        virtual bool poll() override {
             return func();
         }
     };
@@ -960,6 +842,7 @@ class smp {
     using thread_adaptor = posix_thread;
 #endif
     static std::vector<thread_adaptor> _threads;
+    static std::vector<reactor*> _reactors;
     static smp_message_queue** _qs;
     static std::thread::id _tmain;
 
@@ -1352,42 +1235,6 @@ template <typename Clock>
 inline
 typename timer<Clock>::time_point timer<Clock>::get_timeout() {
     return _expiry;
-}
-
-inline
-input_stream<char>
-connected_socket::input() {
-    return _csi->input();
-}
-
-inline
-output_stream<char>
-connected_socket::output() {
-    return _csi->output();
-}
-
-inline
-void
-connected_socket::shutdown_input() {
-    return _csi->shutdown_input();
-}
-
-inline
-void
-connected_socket::shutdown_output() {
-    return _csi->shutdown_output();
-}
-
-inline
-void
-connected_socket::set_nodelay(bool nodelay) {
-    return _csi->set_nodelay(nodelay);
-}
-
-inline
-bool
-connected_socket::get_nodelay() const {
-    return _csi->get_nodelay();
 }
 
 #endif /* REACTOR_HH_ */

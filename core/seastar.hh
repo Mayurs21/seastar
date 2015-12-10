@@ -27,6 +27,8 @@
 /// Seastar is a high performance C++ application framework for high
 /// concurrency server applications.
 ///
+/// A good place to start is the [Tutorial](doc/tutorial.md).
+///
 /// Please see:
 ///   - \ref future-module Documentation on futures and promises, which are
 ///          the seastar building blocks.
@@ -54,6 +56,7 @@ class listen_options;
 
 // file.hh
 class file;
+class file_open_options;
 enum class open_flags;
 enum class fs_type;
 
@@ -137,6 +140,21 @@ future<connected_socket> connect(socket_address sa);
 ///
 /// \relates file
 future<file> open_file_dma(sstring name, open_flags flags);
+
+/// Opens or creates a file.  The "dma" in the name refers to the fact
+/// that data transfers are unbuffered and uncached.
+///
+/// \param name  the name of the file to open or create
+/// \param flags various flags controlling the open process
+/// \param options options for opening the file
+/// \return a \ref file object, as a future
+///
+/// \note
+/// The file name is not guaranteed to be stable on disk, unless the
+/// containing directory is sync'ed.
+///
+/// \relates file
+future<file> open_file_dma(sstring name, open_flags flags, file_open_options options);
 
 /// Checks if a given directory supports direct io
 ///
@@ -230,6 +248,11 @@ future<> rename_file(sstring old_name, sstring new_name);
 ///
 /// \param name name of the file to return the size
 future<uint64_t> file_size(sstring name);
+
+/// check if a file exists.
+///
+/// \param name name of the file to check
+future<bool> file_exists(sstring name);
 
 /// Creates a hard link for a file
 ///

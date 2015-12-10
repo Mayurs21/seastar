@@ -98,6 +98,9 @@ def try_compile_and_run(compiler, flags, source, env = {}):
         xfile.file.close()
         if subprocess.call([compiler, '-x', 'c++', '-o', xfile.name, sfile.name] + flags,
                             stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL) != 0:
+            # The compiler may delete the target on failure, and lead to
+            # NamedTemporaryFile's destructor throwing an exception.
+            open(xfile.name, 'a').close()
             return False
         e = os.environ.copy()
         e.update(env)
@@ -193,6 +196,7 @@ tests = [
     'tests/rpc',
     'tests/semaphore_test',
     'tests/packet_test',
+    'tests/tls_test',
     ]
 
 apps = [
@@ -244,10 +248,12 @@ libnet = [
     'net/udp.cc',
     'net/tcp.cc',
     'net/dhcp.cc',
+    'net/tls.cc',
     ]
 
 core = [
     'core/reactor.cc',
+    'core/systemwide_memory_barrier.cc',
     'core/fstream.cc',
     'core/posix.cc',
     'core/memory.cc',
@@ -260,6 +266,7 @@ core = [
     'net/packet.cc',
     'net/posix-stack.cc',
     'net/net.cc',
+    'net/stack.cc',
     'rpc/rpc.cc',
     ]
 
@@ -284,7 +291,7 @@ boost_test_lib = [
 ]
 
 defines = []
-libs = '-laio -lboost_program_options -lboost_system -lstdc++ -lm -lboost_unit_test_framework -lboost_thread -lcryptopp -lrt'
+libs = '-laio -lboost_program_options -lboost_system -lstdc++ -lm -lboost_unit_test_framework -lboost_thread -lcryptopp -lrt -lgnutls -lgnutlsxx'
 hwloc_libs = '-lhwloc -lnuma -lpciaccess -lxml2 -lz'
 xen_used = False
 def have_xen():
@@ -343,6 +350,7 @@ deps = {
     'tests/udp_client': ['tests/udp_client.cc'] + core + libnet,
     'tests/tcp_server': ['tests/tcp_server.cc'] + core + libnet,
     'tests/tcp_client': ['tests/tcp_client.cc'] + core + libnet,
+    'tests/tls_test': ['tests/tls_test.cc'] + core + libnet + boost_test_lib,
     'apps/seawreck/seawreck': ['apps/seawreck/seawreck.cc', 'http/http_response_parser.rl'] + core + libnet,
     'tests/blkdiscard_test': ['tests/blkdiscard_test.cc'] + core,
     'tests/sstring_test': ['tests/sstring_test.cc'] + core,
@@ -570,7 +578,7 @@ with open(buildfile, 'w') as f:
                         URL: http://seastar-project.org/
                         Description: Advanced C++ framework for high-performance server applications on modern hardware.
                         Version: 1.0
-                        Libs: -L{srcdir}/{builddir} -Wl,--whole-archive -lseastar -Wl,--no-whole-archive {dbgflag} -Wl,--no-as-needed {static} {pie} -fvisibility=hidden -pthread {user_ldflags} {libs} {sanitize_libs}
+                        Libs: -L{srcdir}/{builddir} -Wl,--whole-archive,-lseastar,--no-whole-archive {dbgflag} -Wl,--no-as-needed {static} {pie} -fvisibility=hidden -pthread {user_ldflags} {libs} {sanitize_libs}
                         Cflags: -std=gnu++1y {dbgflag} {fpie} -Wall -Werror -fvisibility=hidden -pthread -I{srcdir} -I{srcdir}/{builddir}/gen {user_cflags} {warnings} {defines} {sanitize} {opt}
                         ''').format(builddir = 'build/' + mode, srcdir = os.getcwd(), **vars)
                 f.write('build $builddir/{}/{}: gen\n  text = {}\n'.format(mode, binary, repr(pc)))
@@ -619,5 +627,13 @@ with open(buildfile, 'w') as f:
             command = find -name '*.[chS]' -o -name "*.cc" -o -name "*.hh" | cscope -bq -i-
             description = CSCOPE
         build cscope: cscope
+        rule md2html
+            command = pandoc --self-contained --toc -c doc/template.css -V documentclass=report --chapters --number-sections -f markdown_github+pandoc_title_block --highlight-style tango $in -o $out
+            description = PANDOC $out
+        rule md2pdf
+            command = pandoc -f markdown_github+pandoc_title_block --highlight-style tango --template=doc/template.tex $in -o $out
+            description = PANDOC $out
+        build doc/tutorial.html: md2html doc/tutorial.md
+        build doc/tutorial.pdf: md2pdf doc/tutorial.md
         default {modes_list}
         ''').format(modes_list = ' '.join(build_modes), **globals()))

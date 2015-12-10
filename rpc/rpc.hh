@@ -83,12 +83,23 @@ public:
         class connection : public protocol::connection, public enable_lw_shared_from_this<connection> {
             server& _server;
             client_info _info;
+            stats _stats;
+        private:
+            future<MsgType, int64_t, std::experimental::optional<temporary_buffer<char>>>
+            read_request_frame(input_stream<char>& in);
         public:
             connection(server& s, connected_socket&& fd, socket_address&& addr, protocol& proto);
-            ~connection() { this->_output_ready.ignore_ready_future(); }
             future<> process();
             future<> respond(int64_t msg_id, sstring&& data);
-            auto& info() { return _info; }
+            client_info& info() { return _info; }
+            const client_info& info() const { return _info; }
+            stats get_stats() const {
+                return _stats;
+            }
+
+            stats& get_stats_internal() {
+                return _stats;
+            }
         };
     private:
         protocol& _proto;
@@ -107,7 +118,13 @@ public:
                     return conn->stop();
                 })
             ).discard_result();
-    }
+        }
+        template<typename Func>
+        void foreach_connection(Func&& f) {
+            for (auto c : _conns) {
+                f(*c);
+            }
+        }
         friend connection;
     };
 
@@ -139,6 +156,10 @@ public:
     private:
         std::unordered_map<id_type, std::unique_ptr<reply_handler_base>> _outstanding;
         stats _stats;
+        ipv4_addr _server_addr;
+    private:
+        future<int64_t, std::experimental::optional<temporary_buffer<char>>>
+        read_response_frame(input_stream<char>& in);
     public:
         client(protocol& proto, ipv4_addr addr, ipv4_addr local = ipv4_addr());
 
@@ -163,13 +184,14 @@ public:
             struct timeout_handler : reply_handler_base {
                 virtual void operator()(client& client, id_type msg_id, temporary_buffer<char> data) {}
             };
+            _stats.timeout++;
             _outstanding[id]->timeout();
             _outstanding[id] = std::make_unique<timeout_handler>();
         }
 
         future<> stop() {
-            this->_error = true;
-            if (_connected) {
+            if (_connected && !this->_error) {
+                this->_error = true;
                 return connection::stop();
             } else {
                 // connection::stop will fail on shutdown(); since we can't shutdown a
@@ -214,6 +236,13 @@ public:
     void log(const client_info& info, id_type msg_id, const sstring& str) {
         log(to_sstring("client ") + inet_ntoa(info.addr.as_posix_sockaddr_in().sin_addr) + " msg_id " + to_sstring(msg_id) + ": " + str);
     }
+    void log(const client_info& info, const sstring& str) {
+        log(to_sstring("client ") + inet_ntoa(info.addr.as_posix_sockaddr_in().sin_addr) + ": " + str);
+    }
+    void log(ipv4_addr addr, const sstring& str) {
+        log(to_sstring("client ") + inet_ntoa(in_addr{addr.ip}) + ": " + str);
+    }
+
 private:
     void register_receiver(MsgType t, rpc_handler&& handler) {
         _handlers.emplace(t, std::move(handler));

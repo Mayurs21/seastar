@@ -58,6 +58,15 @@ struct signature<Ret (const client_info&, In...)> {
     using want_client_info = do_want_client_info;
 };
 
+template <typename Ret, typename... In>
+struct signature<Ret (client_info&, In...)> {
+    using ret_type = Ret;
+    using arg_types = std::tuple<In...>;
+    using clean = signature<Ret (In...)>;
+    using want_client_info = do_want_client_info;
+};
+
+
 template <typename T>
 struct wait_signature {
     using type = wait_type;
@@ -88,15 +97,15 @@ using wait_signature_t = typename wait_signature<T>::type;
 template <typename... In>
 inline
 std::tuple<In...>
-maybe_add_client_info(dont_want_client_info, const client_info& ci, std::tuple<In...>&& args) {
+maybe_add_client_info(dont_want_client_info, client_info& ci, std::tuple<In...>&& args) {
     return std::move(args);
 }
 
 template <typename... In>
 inline
-std::tuple<std::reference_wrapper<const client_info>, In...>
-maybe_add_client_info(do_want_client_info, const client_info& ci, std::tuple<In...>&& args) {
-    return std::tuple_cat(std::make_tuple(std::cref(ci)), std::move(args));
+std::tuple<std::reference_wrapper<client_info>, In...>
+maybe_add_client_info(do_want_client_info, client_info& ci, std::tuple<In...>&& args) {
+    return std::tuple_cat(std::make_tuple(std::ref(ci)), std::move(args));
 }
 
 template <bool IsSmartPtr>
@@ -293,7 +302,7 @@ auto send_helper(MsgType xt, signature<Ret (InArgs...)> xsig) {
             dst.out_ready() = do_with(std::move(data), [&dst] (sstring& data) {
                 return dst.out_ready().then([&dst, &data] () mutable {
                     return dst.out().write(data).then([&dst] {
-                        dst.out().batch_flush();
+                        return dst.out().flush();
                     });
                 });
             }).finally([&dst] () {
@@ -327,13 +336,14 @@ protocol<Serializer, MsgType>::server::connection::respond(int64_t msg_id, sstri
     *unaligned_cast<uint64_t*>(p + 8) = net::hton(data.size() - 16);
     return do_with(std::move(data), this->shared_from_this(), [msg_id] (const sstring& data, lw_shared_ptr<protocol<Serializer, MsgType>::server::connection> conn) {
         return conn->out().write(data.begin(), data.size()).then([conn] {
-            conn->out().batch_flush();
+            return conn->out().flush();
         });
     });
 }
 
 template<typename Serializer, typename MsgType, typename... RetTypes>
 inline future<> reply(wait_type, future<RetTypes...>&& r, int64_t msgid, typename protocol<Serializer, MsgType>::server::connection& client) {
+    client.get_stats_internal().sent_messages++;
     try {
         auto&& data = r.get();
         auto str = ::apply(marshall<Serializer, const RetTypes&...>,
@@ -389,9 +399,14 @@ auto recv_helper(signature<Ret (InArgs...)> sig, Func&& func, WantClientInfo wci
         // note: apply is executed asynchronously with regards to networking so we cannot chain futures here by doing "return apply()"
         apply(func, client->info(), WantClientInfo(), signature(), std::move(args)).then_wrapped(
                 [client, msg_id] (futurize_t<typename signature::ret_type> ret) {
-            client->out_ready() = client->out_ready().then([client, msg_id, ret = std::move(ret)] () mutable {
-                return reply<Serializer, MsgType>(wait_style(), std::move(ret), msg_id, *client);
-            });
+            if (!client->error()) {
+                client->out_ready() = client->out_ready().then([client, msg_id, ret = std::move(ret)] () mutable {
+                    client->get_stats_internal().pending++;
+                    return reply<Serializer, MsgType>(wait_style(), std::move(ret), msg_id, *client).finally([client]() {
+                        client->get_stats_internal().pending--;
+                    });
+                });
+            }
         });
     };
 }
@@ -418,11 +433,16 @@ template<typename Ret, typename First, typename... Args>
 struct handler_type_helper<Ret, First, Args...> {
     using type = Ret(First, Args...);
     static constexpr bool info = false;
-    static_assert(!std::is_same<client_info&, First>::value, "reference to client_info has to be const");
 };
 
 template<typename Ret, typename... Args>
 struct handler_type_helper<Ret, const client_info&, Args...> {
+    using type = Ret(Args...);
+    static constexpr bool info = true;
+};
+
+template<typename Ret, typename... Args>
+struct handler_type_helper<Ret, client_info&, Args...> {
     using type = Ret(Args...);
     static constexpr bool info = true;
 };
@@ -539,22 +559,26 @@ protocol<Serializer, MsgType>::server::connection::connection(protocol<Serialize
     _info.addr = std::move(addr);
 }
 
-template <typename MsgType>
-future<MsgType, int64_t, temporary_buffer<char>>
-read_request_frame(input_stream<char>& in) {
-    return in.read_exactly(24).then([&in] (temporary_buffer<char> header) {
+template <typename Serializer, typename MsgType>
+future<MsgType, int64_t, std::experimental::optional<temporary_buffer<char>>>
+protocol<Serializer, MsgType>::server::connection::read_request_frame(input_stream<char>& in) {
+    return in.read_exactly(24).then([this, &in] (temporary_buffer<char> header) {
         if (header.size() != 24) {
-            throw rpc::error("bad response frame header");
+            if (header.size() != 0) {
+                this->_server._proto.log(_info, "unexpected eof");
+            }
+            return make_ready_future<MsgType, int64_t, std::experimental::optional<temporary_buffer<char>>>(MsgType(0), 0, std::experimental::optional<temporary_buffer<char>>());
         }
         auto ptr = header.get();
         auto type = MsgType(net::ntoh(*unaligned_cast<uint64_t>(ptr)));
         auto msgid = net::ntoh(*unaligned_cast<int64_t*>(ptr + 8));
         auto size = net::ntoh(*unaligned_cast<uint64_t*>(ptr + 16));
-        return in.read_exactly(size).then([type, msgid, size] (temporary_buffer<char> data) {
+        return in.read_exactly(size).then([this, type, msgid, size] (temporary_buffer<char> data) {
             if (data.size() != size) {
-                throw rpc::error("truncated data frame");
+                this->_server._proto.log(_info, "unexpected eof");
+                return make_ready_future<MsgType, int64_t, std::experimental::optional<temporary_buffer<char>>>(MsgType(0), 0, std::experimental::optional<temporary_buffer<char>>());
             }
-            return make_ready_future<MsgType, int64_t, temporary_buffer<char>>(type, msgid, std::move(data));
+            return make_ready_future<MsgType, int64_t, std::experimental::optional<temporary_buffer<char>>>(type, msgid, std::experimental::optional<temporary_buffer<char>>(std::move(data)));
         });
     });
 }
@@ -562,48 +586,62 @@ read_request_frame(input_stream<char>& in) {
 template<typename Serializer, typename MsgType>
 future<> protocol<Serializer, MsgType>::server::connection::process() {
     return do_until([this] { return this->_read_buf.eof() || this->_error; }, [this] () mutable {
-        return read_request_frame<MsgType>(this->_read_buf).then([this] (MsgType type, int64_t msg_id, temporary_buffer<char> data) {
-            //return unmarshall(this->serializer(), this->_read_buf, std::tie(_type)).then([this] {
+        return this->read_request_frame(this->_read_buf).then([this] (MsgType type, int64_t msg_id, std::experimental::optional<temporary_buffer<char>> data) {
             auto it = _server._proto._handlers.find(type);
-            if (it != _server._proto._handlers.end()) {
-                it->second(this->shared_from_this(), msg_id, std::move(data));
+            if (data && it != _server._proto._handlers.end()) {
+                it->second(this->shared_from_this(), msg_id, std::move(data.value()));
             } else {
                 this->_error = true;
             }
         });
-    }).finally([this, conn_ptr = this->shared_from_this()] () {
+    }).then_wrapped([this] (future<> f) {
+        f.ignore_ready_future();
+        this->_error = true;
+        return this->out_ready().then_wrapped([this] (future<> f) {
+            f.ignore_ready_future();
+            return this->_write_buf.close();
+        }).then_wrapped([this] (future<> f) {
+            f.ignore_ready_future();
+            if (!this->_server._stopping) {
+                // if server is stopping do not remove connection
+                // since it may invalidate _conns iterators
+                this->_server._conns.erase(this);
+            }
+            this->_stopped.set_value();
+        });
+    }).finally([conn_ptr = this->shared_from_this()] {
         // hold onto connection pointer until do_until() exists
-        if (!this->_server._stopping) {
-            // if server is stopping do not remove connection
-            // since it may invalidate _conns iterators
-            this->_server._conns.erase(this);
-        }
-        this->_stopped.set_value();
     });
 }
 
 // FIXME: take out-of-line?
+template<typename Serializer, typename MsgType>
 inline
-future<int64_t, temporary_buffer<char>>
-read_response_frame(input_stream<char>& in) {
-    return in.read_exactly(16).then([&in] (temporary_buffer<char> header) {
+future<int64_t, std::experimental::optional<temporary_buffer<char>>>
+protocol<Serializer, MsgType>::client::read_response_frame(input_stream<char>& in) {
+    return in.read_exactly(16).then([this, &in] (temporary_buffer<char> header) {
         if (header.size() != 16) {
-            throw rpc::error("bad response frame header");
+            if (header.size() != 0) {
+                this->_proto.log(this->_server_addr, "unexpected eof");
+            }
+            return make_ready_future<int64_t, std::experimental::optional<temporary_buffer<char>>>(0, std::experimental::optional<temporary_buffer<char>>());
         }
+
         auto ptr = header.get();
         auto msgid = net::ntoh(*unaligned_cast<int64_t*>(ptr));
         auto size = net::ntoh(*unaligned_cast<uint64_t*>(ptr + 8));
-        return in.read_exactly(size).then([msgid, size] (temporary_buffer<char> data) {
+        return in.read_exactly(size).then([this, msgid, size] (temporary_buffer<char> data) {
             if (data.size() != size) {
-                throw rpc::error("truncated data frame");
+                this->_proto.log(this->_server_addr, "unexpected eof");
+                return make_ready_future<int64_t, std::experimental::optional<temporary_buffer<char>>>(0, std::experimental::optional<temporary_buffer<char>>());
             }
-            return make_ready_future<int64_t, temporary_buffer<char>>(msgid, std::move(data));
+            return make_ready_future<int64_t, std::experimental::optional<temporary_buffer<char>>>(msgid, std::experimental::optional<temporary_buffer<char>>(std::move(data)));
         });
     });
 }
 
 template<typename Serializer, typename MsgType>
-protocol<Serializer, MsgType>::client::client(protocol<Serializer, MsgType>& proto, ipv4_addr addr, ipv4_addr local) : protocol<Serializer, MsgType>::connection(proto) {
+protocol<Serializer, MsgType>::client::client(protocol<Serializer, MsgType>& proto, ipv4_addr addr, ipv4_addr local) : protocol<Serializer, MsgType>::connection(proto), _server_addr(addr) {
     this->_output_ready = _connected_promise.get_future();
     engine().net().connect(make_ipv4_address(addr), make_ipv4_address(local)).then([this] (connected_socket fd) {
         fd.set_nodelay(true);
@@ -613,19 +651,19 @@ protocol<Serializer, MsgType>::client::client(protocol<Serializer, MsgType>& pro
         this->_connected_promise.set_value();
         this->_connected = true;
         return do_until([this] { return this->_read_buf.eof() || this->_error; }, [this] () mutable {
-            return read_response_frame(this->_read_buf).then([this] (int64_t msg_id, temporary_buffer<char> data) {
-                //auto unmarshall(this->serializer(), this->_read_buf, std::tie(_rcv_msg_id)).then([this] {
+            return this->read_response_frame(this->_read_buf).then([this] (int64_t msg_id, std::experimental::optional<temporary_buffer<char>> data) {
                 auto it = _outstanding.find(::abs(msg_id));
-                if (it != _outstanding.end()) {
+                if (data && it != _outstanding.end()) {
                     auto handler = std::move(it->second);
                     _outstanding.erase(it);
-                    (*handler)(*this, msg_id, std::move(data));
+                    (*handler)(*this, msg_id, std::move(data.value()));
                 } else {
                     this->_error = true;
                 }
             });
         });
-    }).finally([this] {
+    }).then_wrapped([this] (future<> f){
+        f.ignore_ready_future();
         this->_error = true;
         auto need_close = _connected;
         if (!_connected) {

@@ -80,6 +80,9 @@ template <typename Iterator, typename Func>
 inline
 future<>
 parallel_for_each(Iterator begin, Iterator end, Func&& func) {
+    if (begin == end) {
+        return make_ready_future<>();
+    }
     return do_with(parallel_for_each_state(), [&] (parallel_for_each_state& state) -> future<> {
         // increase ref count to ensure all functions run
         ++state.waiting;
@@ -87,12 +90,10 @@ parallel_for_each(Iterator begin, Iterator end, Func&& func) {
             ++state.waiting;
             try {
                 func(*begin++).then_wrapped([&] (future<> f) {
-                    try {
-                        f.get();
-                    } catch (...) {
+                    if (f.failed()) {
                         // We can only store one exception.  For more, use when_all().
                         if (!state.ex) {
-                            state.ex = std::move(std::current_exception());
+                            state.ex = f.get_exception();
                         }
                     }
                     state.complete();
@@ -146,11 +147,10 @@ void do_until_continued(StopCondition&& stop_cond, AsyncAction&& action, promise
             if (!f.available()) {
                 f.then_wrapped([action = std::forward<AsyncAction>(action),
                     stop_cond = std::forward<StopCondition>(stop_cond), p = std::move(p)](std::result_of_t<AsyncAction()> fut) mutable {
-                    try {
-                        fut.get();
+                    if (!fut.failed()) {
                         do_until_continued(stop_cond, std::forward<AsyncAction>(action), std::move(p));
-                    } catch(...) {
-                        p.set_exception(std::current_exception());
+                    } else {
+                        p.set_exception(fut.get_exception());
                     }
                 });
                 return;
@@ -213,6 +213,80 @@ future<> repeat(AsyncAction&& action) {
     auto f = p.get_future();
     schedule(make_task([action = std::forward<AsyncAction>(action), p = std::move(p)] () mutable {
         repeat(std::forward<AsyncAction>(action)).forward_to(std::move(p));
+    }));
+    return f;
+}
+
+/// \cond internal
+
+template <typename T>
+struct repeat_until_value_type_helper;
+
+/// \endcond
+
+/// Type helper for repeat_until_value()
+template <typename T>
+struct repeat_until_value_type_helper<future<std::experimental::optional<T>>> {
+    /// The type of the value we are computing
+    using value_type = T;
+    /// Type used by \c AsyncAction while looping
+    using optional_type = std::experimental::optional<T>;
+    /// Return type of repeat_until_value()
+    using future_type = future<value_type>;
+    /// Return type of \c AsyncAction
+    using future_optional_type = future<optional_type>;
+};
+
+/// Return value of repeat_until_value()
+template <typename AsyncAction>
+using repeat_until_value_return_type
+        = typename repeat_until_value_type_helper<std::result_of_t<AsyncAction()>>::future_type;
+
+/// Invokes given action until it fails or the function requests iteration to stop by returning
+/// an engaged \c future<std::experimental::optional<T>>.  The value is extracted from the
+/// \c optional, and returned, as a future, from repeat_until_value().
+///
+/// \param action a callable taking no arguments, returning a future<std::experimental::optional<T>>.
+///               Will be called again as soon as the future resolves, unless the
+///               future fails, action throws, or it resolves with an engaged \c optional.
+///               If \c action is an r-value it can be moved in the middle of iteration.
+/// \return a ready future if we stopped successfully, or a failed future if
+///         a call to to \c action failed.  The \c optional's value is returned.
+template<typename AsyncAction>
+repeat_until_value_return_type<AsyncAction>
+repeat_until_value(AsyncAction&& action) {
+    using type_helper = repeat_until_value_type_helper<std::result_of_t<AsyncAction()>>;
+    // the "T" in the documentation
+    using value_type = typename type_helper::value_type;
+    using optional_type = typename type_helper::optional_type;
+    using futurator = futurize<typename type_helper::future_optional_type>;
+    do {
+        auto f = futurator::apply(action);
+
+        if (!f.available()) {
+            return f.then([action = std::forward<AsyncAction>(action)] (auto&& optional) mutable {
+                if (optional) {
+                    return make_ready_future<value_type>(std::move(optional).value());
+                } else {
+                    return repeat_until_value(std::forward<AsyncAction>(action));
+                }
+            });
+        }
+
+        if (f.failed()) {
+            return make_exception_future<value_type>(f.get_exception());
+        }
+
+        optional_type&& optional = std::move(f).get0();
+        if (optional) {
+            return make_ready_future<value_type>(std::move(optional).value());
+        }
+    } while (++future_avail_count % max_inlined_continuations);
+
+    promise<value_type> p;
+    auto f = p.get_future();
+    schedule(make_task([action = std::forward<AsyncAction>(action), p = std::move(p)] () mutable {
+        repeat_until_value(std::forward<AsyncAction>(action)).forward_to(std::move(p));
     }));
     return f;
 }
